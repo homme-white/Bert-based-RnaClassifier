@@ -24,8 +24,8 @@ def create_vocab_file(k_mers, vocab_file_path):
 
 
 if __name__ == "__main__":
-    k = 6  # 设置k-mer大小
-    vocab_file_path = 'vocab_rna_6mer.txt'  # 输出文件路径
+    k = 5  # 设置k-mer大小
+    vocab_file_path = 'vocabs.txt'  # 输出文件路径
 
     # 生成所有6-mer组合
     k_mers = generate_k_mers(k)
