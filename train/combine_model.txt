@@ -1,0 +1,292 @@
+import os
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models  # 使用官方库
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score，roc_auc_score, matthews_corrcoef
+from sklearn.model_selection import train_test_split
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '6,7'
+
+# 设置随机种子
+torch.manual_seed(42)
+np.random.seed(42)
+
+class DNADataset(Dataset):
+    # 保持原有数据读取逻辑不变
+    def __init__(self, pos_bert_dir, neg_bert_dir, pos_pse_csv_path, neg_pse_csv_path, pos_rnafold_path, neg_rnafold_path):
+        pos_pse = pd.read_csv(pos_pse_csv_path, header=None).values
+        neg_pse = pd.read_csv(neg_pse_csv_path, header=None).values
+        self.pse_features = np.concatenate([pos_pse, neg_pse]).astype(np.float32)
+        pos_rnafold = np.load(pos_rnafold_path)  # (N,3000,3)
+        neg_rnafold = np.load(neg_rnafold_path)
+        self.rnafold_features = np.concatenate([pos_rnafold, neg_rnafold]).astype(np.float32)
+        self.labels = np.concatenate([
+            np.ones(len(pos_pse)),
+            np.zeros(len(neg_pse))
+        ]).astype(np.int64)
+
+        self.bert_files = []
+        for folder in [pos_bert_dir, neg_bert_dir]:
+            files = sorted([f for f in os.listdir(folder) if f.endswith('.npy')])
+            self.bert_files.extend([os.path.join(folder, f) for f in files])
+
+    def __len__(self):
+        return len(self.bert_files)
+
+    def __getitem__(self, idx):
+        bert_feat = np.load(self.bert_files[idx]).astype(np.float32)
+        pse_feat = self.pse_features[idx]
+        rnafold_feat = self.rnafold_features[idx]
+        label = self.labels[idx]
+        return (
+            torch.from_numpy(bert_feat),
+            torch.from_numpy(pse_feat),
+            torch.from_numpy(rnafold_feat),
+            torch.tensor(label, dtype=torch.long)
+        )
+
+class FusionModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        # 将Pse特征扩展到与BERT相同的空间维度
+        self.pse_expand = nn.Sequential(
+            nn.Linear(64, 64 * 16 * 32),
+            nn.ReLU(),
+            nn.Unflatten(1, (64, 16, 32))
+        )
+        self.rnafold_processor = nn.Sequential(
+            nn.Conv1d(3, 64, kernel_size=3, padding=1),  # 处理3通道特征
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(512),  # 统一时间维度
+            nn.Flatten(),
+            nn.Linear(512*64, 64*16*32),
+            nn.ReLU(),
+            nn.Unflatten(1, (64, 16, 32))
+        )
+
+        # 加载官方EfficientNet-B1模型
+        self.efficientnet = models.efficientnet_b1(pretrained=False)
+
+        # 获取原始第一个卷积模块的参数
+        original_block = self.efficientnet.features[0]
+        original_conv = original_block[0]  # 实际卷积层在模块的第一个位置
+
+        # 创建新的卷积模块（保持原结构的Norm和Activation）
+        new_conv_block = nn.Sequential(
+            nn.Conv2d(
+                in_channels=896,  # 768+64+64
+                out_channels=original_conv.out_channels,
+                kernel_size=original_conv.kernel_size,
+                stride=original_conv.stride,
+                padding=original_conv.padding,
+                bias=False
+            ),
+            original_block[1],  # 保持原BN层
+            original_block[2]   # 保持原激活函数
+        )
+
+        # 替换原模块
+        self.efficientnet.features[0] = new_conv_block
+
+        # 替换分类层
+        in_features = self.efficientnet.classifier[1].in_features
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(in_features, num_classes))
+
+    def forward(self, bert, pse, rnafold):
+        bert = bert.view(-1, 768, 16, 32)
+        pse = self.pse_expand(pse)
+        rnafold = rnafold.permute(0, 2, 1)  # (B,3,3000)->(B,64,16,32)
+        rnafold = self.rnafold_processor(rnafold)
+        fused = torch.cat([bert, pse, rnafold], dim=1)
+        return self.efficientnet(fused)
+
+def main():
+    # 数据路径
+    POS_BERT_DIR = '../processed/new_bert/lnc_train_com'
+    NEG_BERT_DIR = '../processed/new_bert/pc_train_com'
+    POS_PSE_CSV = 'ilearn_data/lnc_com_train.csv'
+    NEG_PSE_CSV = 'ilearn_data/pc_com_train.csv'
+    POS_RNAFOLD = 'rnafold/lnc_c.npy'
+    NEG_RNAFOLD = 'rnafold/lnc_c.npy'
+    # 超参数
+    batch_size = 192
+    lr = 2e-5
+    epochs = 70
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 初始化数据集
+    dataset = DNADataset(
+        POS_BERT_DIR, NEG_BERT_DIR,
+        POS_PSE_CSV, NEG_PSE_CSV,
+        POS_RNAFOLD, NEG_RNAFOLD
+    )
+
+    # 输出数据集基本信息
+    print("="*60)
+    print("Dataset Information:")
+    print(f"Total samples: {len(dataset)}")
+    print(f"PSE features shape per sample: {dataset.pse_features.shape[1:]}")  # (64,)
+    print(f"BERT features shape per sample: {np.load(dataset.bert_files[0]).shape}")  # (768, 512)
+    print(f"Label count: Positive={len(dataset.labels[dataset.labels==1])}, Negative={len(dataset.labels[dataset.labels==0])}")
+
+    # 数据集划分
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    # 输出划分后的数据集大小
+    print("\nDataset Split:")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+
+    # 创建数据加载器
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # 输出加载器大小（每个epoch的batch数）
+    print("\nDataLoader Sizes:")
+    print(f"Train batches per epoch: {len(train_loader)}")
+    print(f"Validation batches per epoch: {len(val_loader)}")
+    print("="*60)
+
+    # 初始化模型和优化器
+    model = FusionModel().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    best_val_loss = float('inf')
+    writer = SummaryWriter()
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        all_preds, all_labels = [], []
+
+       for batch in train_loader:
+            bert, pse, rnafold, labels = batch
+            bert, pse, rnafold, labels = bert.to(device), pse.to(device), rnafold.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(bert, pse, rnafold)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            # ✅ 添加 .detach() 断开梯度
+            probs = torch.softmax(outputs, dim=1)[:, 1].detach()
+            preds = torch.argmax(outputs, dim=1).detach()
+            all_train_preds.extend(preds.cpu().numpy())
+            all_train_labels.extend(labels.cpu().numpy())
+            all_train_probs.extend(probs.cpu().numpy())
+            train_loss += loss.item()
+
+         # 计算训练指标
+        train_acc = accuracy_score(all_train_labels, all_train_preds)
+        train_f1 = f1_score(all_train_labels, all_train_preds)
+        train_recall = recall_score(all_train_labels, all_train_preds)
+        train_precision = precision_score(all_train_labels, all_train_preds)
+        train_auc = roc_auc_score(all_train_labels, all_train_probs)
+        train_mcc = matthews_corrcoef(all_train_labels, all_train_preds)
+
+        # 验证
+        model.eval()
+        val_loss = 0.0
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+             for batch in val_loader:
+                bert, pse, rnafold, labels = batch
+                bert, pse, rnafold, labels = bert.to(device), pse.to(device), rnafold.to(device), labels.to(device)
+                outputs = model(bert, pse, rnafold)
+                loss = criterion(outputs, labels)
+                probs = torch.softmax(outputs, dim=1)[:, 1].detach()
+                preds = torch.argmax(outputs, dim=1).detach()
+                all_val_preds.extend(preds.cpu().numpy())
+                all_val_labels.extend(labels.cpu().numpy())
+                all_val_probs.extend(probs.cpu().numpy())
+                val_loss += loss.item()
+
+         # 计算验证指标
+        val_acc = accuracy_score(all_val_labels, all_val_preds)
+        val_f1 = f1_score(all_val_labels, all_val_preds)
+        val_recall = recall_score(all_val_labels, all_val_preds)
+        val_precision = precision_score(all_val_labels, all_val_preds)
+        val_auc = roc_auc_score(all_val_labels, all_val_probs)
+        val_mcc = matthews_corrcoef(all_val_labels, all_val_preds)
+
+        # 更新 TensorBoard
+        writer.add_scalars('Loss', {'train': train_loss / len(train_loader), 'val': val_loss / len(val_loader)}, epoch)
+        writer.add_scalars('Accuracy', {'train': train_acc, 'val': val_acc}, epoch)
+        writer.add_scalars('F1 Score', {'train': train_f1, 'val': val_f1}, epoch)
+        writer.add_scalars('Recall', {'train': train_recall, 'val': val_recall}, epoch)
+        writer.add_scalars('Precision', {'train': train_precision, 'val': val_precision}, epoch)
+        writer.add_scalars('AUC', {'train': train_auc, 'val': val_auc}, epoch)
+        writer.add_scalars('MCC', {'train': train_mcc, 'val': val_mcc}, epoch)
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_model_combine.pth')
+
+          # 打印每个 epoch 的结果
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Train Loss: {train_loss / len(train_loader):.4f} | Val Loss: {val_loss / len(val_loader):.4f}")
+        print(f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
+        print(f"Train Recall: {train_recall:.4f} | Val Recall: {val_recall:.4f}")
+        print(f"Train Precision: {train_precision:.4f} | Val Precision: {val_precision:.4f}")
+        print(f"Train AUC: {train_auc:.4f} | Val AUC: {val_auc:.4f}")
+        print(f"Train MCC: {train_mcc:.4f} | Val MCC: {val_mcc:.4f}")
+        print('-' * 40)
+
+
+    # 训练结束后，加载最佳模型并输出其性能
+    print("\n" + "="*60)
+    print("Final Evaluation on Best Model:")
+
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_model_combine.pth'))
+    model.eval()
+
+    # 重新计算验证集的指标
+    val_loss = 0.0
+    val_preds, val_labels = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            bert, pse, rnafold, labels = batch
+            bert, pse, rnafold, labels = bert.to(device), pse.to(device), rnafold.to(device), labels.to(device)
+            outputs = model(bert, pse, rnafold)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * bert.size(0)
+            # ✅ 显式添加 .detach() 以确保安全
+            probs = torch.softmax(outputs, dim=1)[:, 1].detach()
+            preds = torch.argmax(outputs, dim=1).detach()
+            all_val_preds_best.extend(preds.cpu().numpy())
+            all_val_labels_best.extend(labels.cpu().numpy())
+            all_val_probs_best.extend(probs.cpu().numpy())
+
+   # 最佳模型的最终评估指标
+    final_auc = roc_auc_score(all_val_labels_best, all_val_probs_best)
+    final_mcc = matthews_corrcoef(all_val_labels_best, all_val_preds_best)
+    final_acc = accuracy_score(all_val_labels_best, all_val_preds_best)
+    final_f1 = f1_score(all_val_labels_best, all_val_preds_best)
+    final_recall = recall_score(all_val_labels_best, all_val_preds_best)
+    final_precision = precision_score(all_val_labels_best, all_val_preds_best)
+
+    print("\nBest Model Final Evaluation:")
+    print(f"Accuracy: {final_acc:.4f}")
+    print(f"F1 Score: {final_f1:.4f}")
+    print(f"Recall: {final_recall:.4f}")
+    print(f"Precision: {final_precision:.4f}")
+    print(f"AUC: {final_auc:.4f}")
+    print(f"MCC: {final_mcc:.4f}")
+
+if __name__ == '__main__':
+    main()
